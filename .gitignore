@@ -1,6 +1,4 @@
 plots
-models
 __pycache__/
 bank-full.csv
 index.html
-train_model.py
