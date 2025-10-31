@@ -1,0 +1,526 @@
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import joblib # Usaremos joblib en lugar de pickle para cargar
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, roc_auc_score, RocCurveDisplay,
+    ConfusionMatrixDisplay, PrecisionRecallDisplay # Añadido
+)
+
+# Inicializar la aplicación FastAPI
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ========================
+# Rutas de archivos
+# ========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Usando los nombres de archivos proporcionados: modelo_svm.pkl y scaler.pkl
+MODEL_PATH = os.path.join(BASE_DIR, "modelo_svm.pkl")
+SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
+
+PLOTS_DIR = os.path.join(BASE_DIR, "plots")
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+CONFUSION_PATH = os.path.join(PLOTS_DIR, "confusion_matrix.png")
+ROC_PATH = os.path.join(PLOTS_DIR, "roc_curve.png")
+PR_PATH = os.path.join(PLOTS_DIR, "precision_recall_curve.png")
+
+# Cargar modelo y scaler con joblib
+try:
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"No se encuentra el archivo: {MODEL_PATH}")
+        
+    # Cargar el modelo con joblib
+    model = joblib.load(MODEL_PATH)
+        
+    if not os.path.exists(SCALER_PATH):
+        raise FileNotFoundError(f"No se encuentra el archivo: {SCALER_PATH}")
+        
+    # Cargar el scaler con joblib
+    scaler = joblib.load(SCALER_PATH)
+
+    # Nota: No se carga 'label_encoders.pkl' ya que tu proceso usa One-Hot Encoding
+    # y la lógica iterativa de '.items()' no aplica aquí.
+        
+except FileNotFoundError as e:
+    print(f"Error al cargar archivos: {e}")
+    raise
+except Exception as e:
+    print(f"Error inesperado al cargar archivos: {e}")
+    # Nota: Las advertencias de versión de sklearn aparecen aquí
+    print("Verifica las versiones de scikit-learn. El modelo debe cargarse en la misma versión con la que fue entrenado.")
+    raise
+
+# ========================
+# Cargar datos de prueba y Preprocesamiento
+# ========================
+try:
+    df_raw = pd.read_csv(os.path.join(BASE_DIR, "bank-full.csv"), sep=';')
+    
+    # 1. Conversión de Columna Objetivo 'y' (debe hacerse primero)
+    df_raw['y'] = df_raw['y'].map({'yes': 1, 'no': 0})
+    
+    # 2. One-Hot Encoding de Variables Categóricas (igual que en el entrenamiento)
+    categorical_cols_to_encode = df_raw.select_dtypes(include=['object']).columns.tolist()
+    
+    # Aplicar One-Hot Encoding
+    df_processed = pd.get_dummies(df_raw, columns=categorical_cols_to_encode, drop_first=True, dtype=int)
+    
+    # Separar X e y
+    X = df_processed.drop('y', axis=1)
+    y = df_processed['y']
+
+    # Identificar columnas numéricas para escalar
+    # Estas son las columnas que se ajustaron con el scaler original
+    numeric_cols = ['age', 'balance', 'day', 'duration', 'campaign', 'pdays', 'previous']
+    
+    # 3. Escalar las características numéricas
+    X[numeric_cols] = scaler.transform(X[numeric_cols])
+
+    # El modelo SVM espera un array de numpy
+    X_scaled = X.values 
+    
+    # Predicciones y métricas
+    y_pred = model.predict(X_scaled)
+    y_prob = model.predict_proba(X_scaled)[:, 1]
+
+    accuracy = accuracy_score(y, y_pred)
+    precision = precision_score(y, y_pred)
+    recall = recall_score(y, y_pred)
+    f1 = f1_score(y, y_pred)
+    roc_auc = roc_auc_score(y, y_prob)
+    cm = confusion_matrix(y, y_pred)
+
+    # ========================
+    # Generar gráficas
+    # ========================
+    plt.style.use('dark_background')
+    
+    # Matriz de confusión
+    fig, ax = plt.subplots(figsize=(8,6))
+    ConfusionMatrixDisplay(cm, display_labels=["No","Yes"]).plot(ax=ax)
+    plt.title("Matriz de Confusión - SVM")
+    plt.tight_layout()
+    plt.savefig(CONFUSION_PATH, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    # Curva ROC
+    fig, ax = plt.subplots(figsize=(8,6))
+    RocCurveDisplay.from_estimator(model, X_scaled, y, ax=ax)
+    plt.title("Curva ROC/AUC - SVM")
+    plt.tight_layout()
+    plt.savefig(ROC_PATH, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    # Curva Precisión-Recall
+    fig, ax = plt.subplots(figsize=(8,6))
+    PrecisionRecallDisplay.from_estimator(model, X_scaled, y, ax=ax)
+    plt.title("Curva Precisión vs Recall - SVM")
+    plt.tight_layout()
+    plt.savefig(PR_PATH, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+except Exception as e:
+    print(f"Error procesando datos o generando métricas/gráficas: {e}")
+    raise
+
+# ========================
+# Endpoints API
+# ========================
+@app.get("/")
+def root():
+    return {"message": "API de Clasificación SVM con métricas y gráficas"}
+
+@app.get("/metrics")
+def get_metrics():
+    return JSONResponse({
+        "Modelo": "Support Vector Machine (SVM)",
+        "Accuracy": float(round(accuracy, 4)),
+        "Precision": float(round(precision, 4)),
+        "Recall": float(round(recall, 4)), 
+        "F1_Score": float(round(f1, 4)),
+        "ROC_AUC": float(round(roc_auc, 4)),
+        "Confusion_Matrix": np.array(cm).tolist()
+    })
+
+@app.get("/plot/confusion")
+def get_confusion_plot():
+    return FileResponse(CONFUSION_PATH)
+
+@app.get("/plot/roc")
+def get_roc_plot():
+    return FileResponse(ROC_PATH)
+
+@app.get("/plot/precision_recall")
+def get_precision_recall_plot():
+    return FileResponse(PR_PATH)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+# Archivos de artefactos de Machine Learning generados por el código
+*.pkl
+*.joblib
+modelo_svm.pkl
+scaler.pkl
+encoders.pkl
+
+# Archivos de datos sensibles o grandes
+*.csv
+*.xlsx
+bank-full.csv
+
+# Archivos generados por Python y entornos virtuales
+venv/
+__pycache__/
+.ipynb_checkpoints/
+import streamlit as st
+import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests 
+import numpy as np
+import os 
+from contextlib import contextmanager
+from io import BytesIO # Necesario para manejar la imagen binaria de las gráficas
+
+# --- 🛠️ Configuración de la página y Estilos ---
+st.set_page_config(
+    page_title="Support Vector Machine Dashboard",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Paleta de Colores y Fuente Formal: (Mantenemos los estilos CSS)
+st.markdown("""
+<style>
+/* ... (Estilos CSS existentes) ... */
+html, body, [class*="css"] {
+    font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+}
+div.block-container {
+    padding-top: 2rem;
+    padding-bottom: 0rem;
+    padding-left: 1rem;
+    padding-right: 1rem;
+}
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+body {background-color: #f8f9fa;}
+h1, h2, h3 {color: #212529; font-weight: 600;}
+.metric-card {
+    background-color: #ffffff; 
+    border-radius: 8px;
+    padding: 15px;
+    text-align: center;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
+    margin-bottom: 10px;
+    border-left: 5px solid;
+    transition: all 0.3s ease-in-out;
+    width: 100%;
+}
+.metric-card:hover {
+    box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1);
+}
+.metric-value {
+    font-size: 2.2em;
+    font-weight: bold; 
+    margin-top: 5px;
+    margin-bottom: 5px;
+}
+.metric-accuracy { border-color: #007bff; }
+.metric-precision { border-color: #28a745; }
+.metric-recall { border-color: #ffc107; }
+.metric-f1_score { border-color: #6f42c1; }
+.value-accuracy { color: #007bff; }
+.value-precision { color: #28a745; }
+.value-recall { color: #ffc107; }
+.value-f1_score { color: #6f42c1; }
+.data-container {
+    background-color: #ffffff;
+    padding: 20px;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: none;
+    margin-bottom: 20px;
+}
+.cm-header {font-weight: bold; text-align: center; color: #495057; border-bottom: 2px solid #adb5bd;}
+.cm-cell {
+    border: 1px solid #e9ecef; 
+    padding: 12px; 
+    text-align: center; 
+    font-size: 1.2em; 
+    font-weight: 500; 
+    border-radius: 0px; 
+    vertical-align: middle;
+}
+.cm-tn { background-color: #f1f3f5; color: #495057; } 
+.cm-fp { background-color: #fae3e6; color: #dc3545; } 
+.cm-fn { background-color: #fff3cd; color: #fd7e14; } 
+.cm-tp { background-color: #d4edda; color: #28a745; } 
+.cm-label {font-weight: bold; padding-right: 10px; color: #212529; text-align: right;}
+.stDataFrame {
+    border: 1px solid #e9ecef;
+    border-radius: 4px;
+}
+.metric-divider {
+    border-top: 1px dashed #ced4da; 
+    margin: 10px 0;
+    visibility: hidden;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- Constantes y Funciones Modificadas ---
+# CAMBIO CLAVE: Usamos el endpoint base de la API
+API_BASE_URL = "http://127.0.0.1:8000" 
+DATA_FILE = "data_svm.json" # Ya no es relevante, pero se mantiene si quieres la lógica local de respaldo
+
+# Datos de simulación (se mantienen como respaldo si la API falla)
+data_simulacion = {
+    "metrics": {
+        "Accuracy": 0.925, "Precision": 0.952, "Recall": 0.909, "F1_Score": 0.930, "ROC_AUC": 0.94,
+        "Confusion_Matrix": [[850, 50], [100, 1000]]
+    },
+    "parameters": {
+        "Modelo": "SVM (Modo Estático / Fallback)",
+        "Kernel": "rbf",
+        "C": 1.0,
+        "Gamma": "scale"
+    },
+    # Las curvas ya no se obtendrán de un JSON, sino de la API como imágenes
+}
+
+@contextmanager
+def suppress_streamlit_output():
+    # ... (función para suprimir output de Streamlit, se mantiene)
+    st_info_orig = st.info
+    st_warning_orig = st.warning
+    st_error_orig = st.error
+    st_success_orig = st.success
+
+    def no_op(*args, **kwargs):
+        pass
+    
+    st.info = no_op
+    st.warning = no_op
+    st.error = no_op
+    st.success = no_op
+    
+    try:
+        yield
+    finally:
+        st.info = st_info_orig
+        st.warning = st_warning_orig
+        st.error = st_error_orig
+        st.success = st_success_orig
+
+
+@st.cache_data
+def fetch_metrics_from_api(base_url):
+    """Obtiene las métricas del endpoint /metrics."""
+    metrics_url = f"{base_url}/metrics"
+    try:
+        response = requests.get(metrics_url, timeout=5) 
+        if response.status_code == 200:
+            data = response.json()
+            # Renombramos las claves para que coincidan con la lógica de tu API
+            data['metrics'] = {
+                'accuracy': data.pop('Accuracy'),
+                'precision': data.pop('Precision'),
+                'recall': data.pop('Recall'),
+                'f1_score': data.pop('F1_Score'),
+                'roc_auc': data.pop('ROC_AUC'),
+            }
+            data['confusionMatrix'] = data.pop('Confusion_Matrix')
+            data['parameters'] = {
+                'Modelo': data.pop('Modelo'),
+                'Kernel': 'N/A (No en la API)', # Opcional: Podrías añadir un endpoint para esto en FastAPI
+                'C': 'N/A (No en la API)',
+                'Gamma': 'N/A (No en la API)'
+            }
+            return data
+    except requests.exceptions.RequestException as e:
+        st.error(f"⚠️ Error al conectar con la API ({metrics_url}). Usando datos de simulación.")
+        # Usar la estructura de fallback con claves renombradas
+        fallback_data = data_simulacion
+        fallback_data['metrics']['roc_auc'] = fallback_data['metrics'].pop('rocCurve')['auc']
+        return fallback_data
+    
+    return data_simulacion
+
+@st.cache_data
+def fetch_plot_from_api(base_url, endpoint):
+    """Obtiene una imagen de gráfica de un endpoint."""
+    plot_url = f"{base_url}{endpoint}"
+    try:
+        response = requests.get(plot_url, timeout=10) 
+        if response.status_code == 200 and 'image' in response.headers.get('Content-Type', ''):
+            # Devolver el contenido binario de la imagen
+            return response.content
+    except requests.exceptions.RequestException as e:
+        st.warning(f"No se pudo cargar la gráfica desde el endpoint: {plot_url}")
+        return None
+    return None
+
+# --- Lógica Principal del Dashboard ---
+
+with suppress_streamlit_output():
+    # CAMBIO: Llamamos a la nueva función de obtención de datos
+    data = fetch_metrics_from_api(API_BASE_URL)
+
+if data:
+    # --- Encabezado y Pestañas ---
+    st.markdown("<h2>Support Vector Machine Dashboard</h2>", unsafe_allow_html=True) 
+    
+    # Asegurarse de que 'parameters' exista si usamos el fallback
+    params = data.get('parameters', data_simulacion['parameters']) 
+    st.sidebar.title("🛠️ Configuración del Modelo")
+    st.sidebar.markdown(f"**Modelo:** **`{params['Modelo']}`**")
+    st.sidebar.markdown(f"**Kernel:** **`{params.get('Kernel', 'N/A')}`**")
+
+    tab_metrics, tab_curves, tab_details = st.tabs(["📊 Métricas Principales", "📈 Curvas de Rendimiento", "⚙️ Detalles del JSON"])
+
+    with tab_metrics:
+        col_left, col_right = st.columns([1, 1])
+
+        with col_left:
+            st.header("Métricas de Rendimiento General")
+
+            # CAMBIO: Usamos las métricas obtenidas directamente
+            metrics = data['metrics']
+            
+            def format_metric(value, color_class):
+                # Manejar el caso de ROC_AUC que no está en el rango 0-1
+                if color_class == 'value-accuracy' and 'ROC_AUC' in color_class:
+                    return f'<div class="metric-value {color_class}">{value:.3f}</div>'
+                return f'<div class="metric-value {color_class}">{value*100:.1f}%</div>'
+
+            # 1. Precision
+            st.markdown('<div class="metric-card metric-precision">', unsafe_allow_html=True)
+            st.markdown("Precision", unsafe_allow_html=True)
+            st.markdown(format_metric(metrics['precision'], 'value-precision'), unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # 2. Recall
+            st.markdown('<div class="metric-card metric-recall">', unsafe_allow_html=True)
+            st.markdown("Recall (Sensibilidad)", unsafe_allow_html=True)
+            st.markdown(format_metric(metrics['recall'], 'value-recall'), unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # 3. Accuracy
+            st.markdown('<div class="metric-card metric-accuracy">', unsafe_allow_html=True)
+            st.markdown("Accuracy (Exactitud)", unsafe_allow_html=True)
+            st.markdown(format_metric(metrics['accuracy'], 'value-accuracy'), unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # 4. F1-Score
+            st.markdown('<div class="metric-card metric-f1_score">', unsafe_allow_html=True)
+            st.markdown("F1-Score", unsafe_allow_html=True)
+            st.markdown(format_metric(metrics['f1_score'], 'value-f1_score'), unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # 5. ROC_AUC
+            st.markdown('<div class="metric-card metric-accuracy">', unsafe_allow_html=True)
+            st.markdown("ROC-AUC", unsafe_allow_html=True)
+            st.markdown(format_metric(metrics['roc_auc'], 'value-accuracy'), unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+
+        with col_right:
+            # --- Matriz de Confusión ---
+            st.subheader("Matriz de Confusión")
+            cm = data['confusionMatrix']
+            TN, FP = cm[0]
+            FN, TP = cm[1]
+
+            st.markdown(f"""
+            <div class="data-container">
+                <table style="width:100%; border-collapse: separate; border-spacing: 0px;">
+                    <thead>
+                        <tr>
+                            <td></td>
+                            <td colspan="2" class="cm-header" style="border-right: none;">Predicción:</td>
+                        </tr>
+                        <tr>
+                            <td></td>
+                            <td class="cm-header">Clase No</td>
+                            <td class="cm-header">Clase Sí</td>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="cm-label" style="border-right: 2px solid #adb5bd;">Real: Clase No</td>
+                            <td class="cm-cell cm-tn">{TN}<br><span style="font-size:0.7em;">Verdadero Negativo (TN)</span></td>
+                            <td class="cm-cell cm-fp">{FP}<br><span style="font-size:0.7em;">Falso Positivo (FP)</span></td>
+                        </tr>
+                        <tr>
+                            <td class="cm-label" style="border-right: 2px solid #adb5bd;">Real: Clase Sí</td>
+                            <td class="cm-cell cm-fn">{FN}<br><span style="font-size:0.7em;">Falso Negativo (FN)</span></td>
+                            <td class="cm-cell cm-tp">{TP}<br><span style="font-size:0.7em;">Verdadero Positivo (TP)</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # --- Parámetros del Modelo ---
+            st.subheader("Parámetros del Modelo SVM")
+            
+            params_df = pd.DataFrame(list(params.items()), columns=['Parámetro', 'Valor'])
+            params_df.set_index('Parámetro', inplace=True)
+            
+            st.markdown('<div class="data-container">', unsafe_allow_html=True)
+            st.dataframe(
+                params_df,
+                hide_index=False,
+                use_container_width=True,
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
+
+    with tab_curves:
+        st.header("Análisis Gráfico de Rendimiento")
+        col_roc, col_pr = st.columns(2)
+        
+        # --- CAMBIO: Obtener y mostrar la imagen de la curva ROC ---
+        with col_roc:
+            st.markdown("### Curva ROC (Receiver Operating Characteristic)")
+            roc_image_bytes = fetch_plot_from_api(API_BASE_URL, "/plot/roc")
+            if roc_image_bytes:
+                st.image(BytesIO(roc_image_bytes), caption="Curva ROC generada por la API")
+            else:
+                st.warning("No se pudo obtener la gráfica ROC de la API.")
+
+        # --- CAMBIO: Obtener y mostrar la imagen de la curva Precision-Recall ---
+        with col_pr:
+            st.markdown("### Curva Precision-Recall")
+            pr_image_bytes = fetch_plot_from_api(API_BASE_URL, "/plot/precision_recall")
+            if pr_image_bytes:
+                st.image(BytesIO(pr_image_bytes), caption="Curva Precision-Recall generada por la API")
+            else:
+                st.warning("No se pudo obtener la gráfica Precision-Recall de la API.")
+
+
+    with tab_details:
+        st.header("Contenido Completo del JSON de Métricas")
+        # Mostrar el JSON completo de métricas (no incluye las gráficas)
+        st.json(data)
+
+# Si la conexión falla y no hay fallback
+if not data:
+    st.error("No se pudo obtener ninguna métrica. Asegúrate de que la API de FastAPI esté corriendo en `http://127.0.0.1:8000`.")
